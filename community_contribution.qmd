@@ -1,0 +1,493 @@
+---
+title: "Survival Analysis in R Demo with Competing Risk"
+author: "Sophie Wagner (sw3767)"
+echo: true
+output: html
+---
+
+# Survival Analysis in R Demo
+
+## Setup
+
+### Load packages
+
+```{r}
+#| warning: false
+rm(list = ls()) # Clearing Environment and Plots
+library(dplyr)  # For data manipulation
+library(forcats)  # For easy factor conversion
+library(rstpm2) # For hazard modelling
+library(cmprsk)  # For competing risk analysis
+library(tidycmprsk)  # For competing risk analysis
+library(survminer)  # For plotting
+library(ggplot2)  # For plotting
+library(ggsurvfit)  # For plotting
+library(readr)  # Read in csv efficiently
+```
+
+### Read in data
+
+**Data source info:**
+
+SEER*Stat Version: 8.4.4*
+
+*Session Type: Case Listing*
+
+*Software: Surveillance Research Program, National Cancer Institute SEER*Stat software (www.seer.cancer.gov/seerstat) version 8.4.4.
+
+Data: Surveillance, Epidemiology, and End Results (SEER) Program (www.seer.cancer.gov) SEER
+
+*SEER\*Stat Database: Incidence - SEER Research Data, 8 Registries, Nov 2023 Sub (1975-2021) - Linked To County Attributes - Time Dependent (1990-2022) Income/Rurality, 1969-2022 Counties, National Cancer Institute, DCCPS, Surveillance Research Program, released April 2024, based on the November 2023 submission.*
+
+-   Primary site: Breast
+
+-   Behavior: Malignant
+
+-   Sequence: First primary cancer
+
+-   Diagnosis reporting source: Not diagnosed by autopsy or death certificate
+
+-   Year of diagnosis: 2010-2015
+
+```{r}
+#| message: false
+#| warning: false
+d <- read_csv("seer_breast_case_listings.csv", col_types = cols(.default = col_factor()))
+```
+
+# Data cleaning
+
+Steps taken: Convert variables to desired type Drop irrelevant columns Handle missing and unknown vals Covariate categorization (collapse categories)
+
+### Convert variables to desired type
+
+```{r}
+# Convert some cols from factor to numeric or character
+d <- d |> 
+  mutate(`Year of diagnosis`=as.numeric(`Year of diagnosis`),
+         `Year of follow-up recode`=as.numeric(`Year of follow-up recode`),
+    `Survival months`=as.numeric(`Survival months`),
+    `Patient ID`=as.character(`Patient ID`))
+```
+
+We need the year and survival data to be numeric. Patient ID doesn't need to be a factor.
+
+### Drop cols with redundant information
+
+```{r}
+d <- d |> 
+  select(-c(`Race recode (White, Black, Other)`,
+           `Race and origin (recommended by SEER)`,
+          `ER Status Recode Breast Cancer (1990+)`,
+          `PR Status Recode Breast Cancer (1990+)`,
+          `Derived HER2 Recode (2010+)`)
+  )
+```
+
+Let's take a look at the data:
+
+```{r}
+head(d)
+```
+
+### Drop unknowns where necessary
+
+```{r}
+d_full <- d |> 
+  filter(`Rural-Urban Continuum Code`!= "Unknown/missing/no match/Not 1990-2022",
+         `Median household income inflation adj to 2022`!="Unknown/missing/no match/Not 1990-2022",
+         !`Breast Subtype (2010+)` %in% c("Unknown","Recode not available"),
+         `SEER historic stage A (1973-2015)` != "Unstaged",
+         `Race and origin recode (NHW, NHB, NHAIAN, NHAPI, Hispanic)`!="Non-Hispanic Unknown Race")
+```
+
+### Collapse categorical variables
+
+```{r}
+summary(d)
+```
+
+What are these (Other) categories? Expand levels:
+
+```{r}
+levels(d$`Median household income inflation adj to 2022`)
+levels(d$`Radiation recode`)
+levels(d$`Histology recode - broad groupings`)
+levels(d$`Age recode with <1 year olds`)
+```
+
+Explore income variable:
+
+```{r}
+# Create ordered factor income variable
+d_full$income.o <- factor(
+  d_full$`Median household income inflation adj to 2022`,
+  levels = c("< $40,000", "$40,000 - $44,999", "$45,000 - $49,999",
+             "$50,000 - $54,999", "$55,000 - $59,999", "$60,000 - $64,999",
+             "$65,000 - $69,999", "$70,000 - $74,999", "$75,000 - $79,999",
+             "$80,000 - $84,999", "$85,000 - $89,999", "$90,000 - $94,999",
+             "$95,000 - $99,999", "$100,000 - $109,999", "$110,000 - $119,999",
+             "$120,000+"),
+  ordered = TRUE)
+# Create numeric income variable
+d_full$income.n <- as.numeric(gsub("[^0-9]", "", sub(" - .*", "", 
+                         d_full$`Median household income inflation adj to 2022`)))
+```
+
+```{r}
+summary(d_full$income.n)
+```
+
+```{r}
+#| fig-width: 15
+#| fig-height: 10
+ggplot(d_full, aes(y=income.o))+
+  geom_bar()
+```
+
+Now that we know a bit more about the distribution of income, we can collapse it in a way that seems intuitive. We will also collapse some other vars at the same time based on domain knowledge:
+
+```{r}
+d_full <- d_full |> 
+  mutate(
+  income_quantile = factor(
+    fct_collapse(
+      `Median household income inflation adj to 2022`,
+       Q1 = c("< $40,000", "$40,000 - $44,999", "$45,000 - $49,999", 
+              "$50,000 - $54,999","$55,000 - $59,999",  "$60,000 - $64,999", 
+              "$65,000 - $69,999"),
+      Q2 = c("$70,000 - $74,999", "$75,000 - $79,999"),
+      Q3 = c("$80,000 - $84,999", "$85,000 - $89,999"),
+      Q4 = c("$90,000 - $94,999", "$95,000 - $99,999", "$100,000 - $109,999", 
+               "$110,000 - $119,999", "$120,000+")
+    ),
+    ordered=TRUE
+  ),
+  income_group = factor(
+    fct_collapse(
+    `Median household income inflation adj to 2022`,
+    "<60k" = c("< $40,000", "$40,000 - $44,999", "$45,000 - $49,999", 
+               "$50,000 - $54,999","$55,000 - $59,999"),
+    "60-80k"=c("$60,000 - $64,999", "$65,000 - $69,999","$70,000 - $74,999", 
+               "$75,000 - $79,999"),
+     "80-100k"=c("$80,000 - $84,999", "$85,000 - $89,999","$90,000 - $94,999", 
+                 "$95,000 - $99,999"),
+    ">100k"=c("$100,000 - $109,999", "$110,000 - $119,999", "$120,000+"), 
+    ),
+    ordered=TRUE
+    ),
+  urban_rural=factor(
+      fct_recode(
+      `Rural-Urban Continuum Code`,
+      "Urban large"="Counties in metropolitan areas ge 1 million pop",
+      "Urban med"="Counties in metropolitan areas of 250,000 to 1 million pop",
+      "Urban med"="Counties in metropolitan areas of lt 250 thousand pop",
+      "Suburban"="Nonmetropolitan counties adjacent to a metropolitan area",
+      "Rural"="Nonmetropolitan counties not adjacent to a metropolitan area"
+      ),
+      ordered=TRUE
+    ),
+  marital_status = fct_collapse(
+    `Marital status at diagnosis`,
+    "Married/Partnered"=c("Married (including common law)",
+                          "Unmarried or Domestic Partner"),
+    "Divorced/Separated"=c("Divorced","Separated"),
+    "Single (never married)"="Single (never married)",
+    "Unknown"="Unknown"
+  )
+)
+```
+
+Let's rename some vars for ease of use:
+
+```{r}
+d_full <- d_full |> rename(age_at_dx=`Age recode with <1 year olds`,
+         stage=`SEER historic stage A (1973-2015)`,
+         radiation=`Radiation recode`,
+         chemo=`Chemotherapy recode (yes, no/unk)`,
+         race_recode = `Race and origin recode (NHW, NHB, NHAIAN, NHAPI, Hispanic)`,
+         other_death.f=`SEER other cause of death classification`,
+         cancer_death.f=`SEER cause-specific death classification`,
+         all_death.f=`Vital status recode (study cutoff used)`,
+         # er_status=`ER Status Recode Breast Cancer (1990+)`,
+         # pr_status=`PR Status Recode Breast Cancer (1990+)`,
+         # her2_status=`Derived HER2 Recode (2010+)`,
+         breast_subtype=`Breast Subtype (2010+)`)
+```
+
+Make some categories ordinal:
+
+```{r}
+d_full$age_at_dx <- factor(d_full$age_at_dx, 
+                           levels = c("01-04 years", "05-09 years", "15-19 years", 
+                                      "20-24 years", "25-29 years", "30-34 years", 
+                                      "35-39 years", "40-44 years", "45-49 years", 
+                                      "50-54 years", "55-59 years", "60-64 years", 
+                                      "65-69 years", "70-74 years", "75-79 years", 
+                                      "80-84 years", "85+ years"), 
+                           ordered = TRUE)
+d_full$stage <- factor(d_full$stage,
+                       levels = c("Localized", "Regional","Distant"),
+                       ordered=TRUE)
+```
+
+Take a look at age distribution:
+
+```{r}
+ggplot(d_full, aes(x=age_at_dx))+
+  geom_bar() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Creating survival and competing risk variables
+
+In survival analysis, we have a **status** variable which indicates whether an individual is still in the cohort (**censored**, meaning alive or lost to follow-up) or has experienced the event of interest (typically death, coded as 1 or higher). We define three specific status variables:
+
+Single-event variables:
+
+`cancer_death`: Indicates 0 if the person is alive or has died from a non-cancer cause, and 1 if they died specifically from cancer (event of interest). `other_death`: Indicates 0 if the person is alive or died from cancer, and 1 if they died from a cause other than cancer (event of interest). `all_death`: Shows 0 if alive and 1 if deceased from any cause, effectively summing `cancer_death` and `other_death`.
+
+Generally, we use `all_death` for **overall survival** analyses because it provides a comprehensive measure of survival, accounting for all possible causes of death, thus capturing overall mortality risk. For **cancer-specific survival**, we focus on `cancer_death`, which isolates cancer as the primary event of interest.
+
+Multi-event variables:
+
+The Competing Risk Status (`cmp_status`) variable combines the outcomes death from cancer and death from other causes, categorizing individuals as alive, cancer-specific death (CSD), or all-cause mortality (ACM).
+
+In **competing risks analysis**, both `cancer_death` and `other_death` are combined into a single variable, allowing us to assess the probabilities of these events within one framework rather than evaluating each separately.
+
+We will recode all of these in both factor form and 0/1/2.. numeric. It is smart to have both factor and numeric versions for the required packages.
+
+```{r}
+d_full$other_death.n <- as.numeric(
+  as.character(
+  fct_recode(
+    d_full$other_death.f,
+    "0"= "Alive or dead due to cancer",
+    "1"= "Dead (attributable to causes other than this cancer dx)"
+  )
+))
+d_full$cancer_death.n <- as.numeric(
+  as.character(
+  fct_recode(
+    d_full$cancer_death.f,
+    "0"= "Alive or dead of other cause",
+    "1"=  "Dead (attributable to this cancer dx)"
+  )
+))
+d_full$all_death.n <- as.numeric(
+  as.character(
+  fct_recode(
+    d_full$all_death.f,
+    "0"= "Alive",
+    "1"= "Dead"
+  )
+))
+```
+
+Create our competing risk variable.
+
+```{r}
+d_full$cmp_status.f <- ifelse(
+  d_full$cancer_death.f=="Dead (attributable to this cancer dx)", "CSD", 
+  ifelse(d_full$other_death.f=="Dead (attributable to causes other than this cancer dx)", "ACM", "Alive"))
+d_full$cmp_status.n <- as.numeric(
+  as.character(
+  fct_recode(
+    d_full$cmp_status.f,
+    "0"="Alive",
+    "1"="CSD",
+    "2"="ACM"
+  )
+))
+```
+
+# Survival analysis
+
+To conduct a detailed survival and competing risks analysis, we use specialized packages like `survival`, `cmprsk`, `tidycmprsk`, and `ggsurvfit`. These packages allow us to estimate survival probabilities, visualize Kaplan-Meier curves, and handle competing risks with cumulative incidence functions (CIF).
+
+survival: Core package for survival analysis in R. It includes functions to create survival objects (Surv) and fit survival models (survfit for Kaplan-Meier and coxph for Cox Proportional Hazards models). Highly customizable, but lacks some visualization features.
+
+ggsurvfit: A wrapper around survival that enhances plot functionality by integrating with ggplot2, allowing easier addition of elements like risk tables and confidence intervals.
+
+cmprsk: Provides functions for competing risks analysis, specifically cumulative incidence functions (CIF) via cuminc and Fine-Gray models (crr). Focus is stats, lacks ggplot2 compatibility
+
+tidycmprsk: A tidyverse-friendly wrapper around cmprsk functions, simplifying syntax and enhancing compatibility with ggplot2 for visualization.
+
+Using these different packages output different types of objects, which can get confusing. Let's take is step by step and see a breakdown of how the components work together, along with their benefits.
+
+## Kaplan-Meier Survival Analysis
+
+### Creating a survival object
+
+Survival objects (`Surv()`) in `survival` and `ggsurvfit` represent time-to-event data.
+
+```{r}
+overall_surv_obj <- survival::Surv(time = d_full$`Survival months`, 
+                         event = d_full$all_death.n)
+```
+
+```{r}
+overall_surv_obj <- ggsurvfit::Surv(time = d_full$`Survival months`, 
+                         event = d_full$all_death.n)
+```
+
+The above gives us a **survival object**. This object can then be used as a **response variable** in survival models. (We don't get that much information out of it until we use it in a survival model.)
+
+```{r}
+summary(overall_surv_obj)
+```
+
+The summary of the survival object doesn't display the survival probabilities directly, but does reveal the status and distribution of censored vs. event cases.
+
+### Fit Kaplan Meier curve
+
+Lets's now compute a survival curve using our censored time-to-event data.
+
+The `ggsurvfit` package makes this easy. Below, we will use `ggsurvfit::survfit2` function which estimates survival probabilities over time. It does the same thing as `survival::survfit` but returns an environment compatible with `ggplot2`-good for plotting.
+
+```{r}
+overall_surv_fit <- survival::survfit(overall_surv_obj ~ stage, data= d_full)
+```
+
+```{r}
+overall_surv_fit <- ggsurvfit::survfit2(overall_surv_obj ~ stage, data=d_full)
+```
+
+```{r}
+overall_surv_fit
+```
+
+```{r}
+summary(overall_surv_fit, times=c(12,24,36,48,60,72,84,96,108,120))
+```
+
+### Plotting the Kaplan-Meier curve
+
+```{r}
+ggsurvfit::ggsurvfit(overall_surv_fit) + 
+  add_confidence_interval() +
+  add_risktable(risktable_stats="n.risk") + 
+  scale_x_continuous(limits = c(0, 120), breaks = seq(0, 120, by = 12)) + 
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent_format(), breaks = seq(0, 1, by = 0.25))
+```
+
+```{r}
+survminer::ggsurvplot(overall_surv_fit, 
+                     risk.table=T,
+                     risk.table.height=0.3, #scale 0-1
+                     pval = T,
+                     conf.int=T,
+                     palette = "Blues",
+                     surv.median.line="hv",
+                     title="Survival plot",
+                     xlab="Months",
+                     ylab="Survival probability",
+                     xlim=c(0,120),
+                     break.x.by=24)
+```
+
+return an object of class ggsurvplot which is list containing the following components:
+
+plot: the survival plot (ggplot object)
+
+table: the number of subjects at risk table per time (ggplot object).
+
+cumevents: the cumulative number of events table (ggplot object).
+
+ncensor.plot: the number of censoring (ggplot object).
+
+data.survplot: the data used to plot the survival curves (data.frame).
+
+data.survtable: the data used to plot the tables under the main survival curves (data.frame).
+
+Can mix and match up to a certain point: If we create with `survival` we cannot add risk table and some other elements that ggsurvfit can do easily.
+
+### Getting the Cox PH Hazard Ratio
+
+To calculate hazard ratios, we fit a Cox Proportional Hazards (Cox PH) model and check for proportional hazards assumptions using residuals.
+
+Fit the coxph model:
+
+```{r}
+# Fit model
+overall_ph <- survival::coxph(overall_surv_obj ~ stage + marital_status + urban_rural + income_quantile, data=d_full) # need survival pkg
+
+# Extract HRs
+summary(overall_ph)
+```
+
+Test for proportional hazards assumption:
+
+```{r}
+overall_test <- survival::cox.zph(overall_ph)
+overall_test
+survminer::ggcoxzph(overall_test) 
+```
+
+The ggcoxzph function from survminer provides plots for each covariate, indicating whether the proportional hazards assumption holds. *Non-horizontal lines suggest potential violations.* And we want a global p-value that is NOT significant (i.e. no significant evidence that the hazard ratio changes over time). Note if you get a significant value, look into: - stratifying by survival time (less than 5 years, greater than 5 years, e.g.) - creating an interaction term between time variable and a covariate that doesn't pass (see if significant relationship)
+
+`survminer` gives you a wrapper around plot.cox.zph and makes plotting super easy!
+
+## Competing risks analysis
+
+In cases where multiple events can occur, (in this case a patient can die from either cancer OR other causes) competing risks analysis is essential. KM cannot account for competing events -- instead, we can look at cumulative incidence functions (CIFs) to estimate the probability of each event type -- while acknowledging that competing events reduce the probability of observing the primary event of interest.
+
+There are a couple of different packages out there for competing risk analysis, and it gets tricky figuring out which one to use!
+
+Cumulative incidence function (CIF) objects in cmprsk and tidycmprsk handle competing risks, representing the probability of specific events over time.
+
+`cmprsk` is the original competing risk package
+
+`tidycmprsk` provides a tidyverse wrapper which makes it easy for plotting and compatible with `ggsurvfit`
+
+Again, we will start by fitting a model, this time with the event variable having more than 1 event. We will use our cmp_status variable, coded with 0=Alive, 1=Cancer-specific death, and 2=Other cause of death.
+
+`cmprsk::cuminc` can take either factor or numeric. Make sure to specify which level is your censoring variable.
+
+```{r}
+cif_obj <- cmprsk::cuminc(ftime=d_full$`Survival months`, 
+                          fstatus=d_full$cmp_status.f,
+                          cencode="Alive",
+                          group=d_full$stage)
+```
+
+```{r}
+cmprsk::plot.cuminc(cif_obj,main="Cumulative inc funciton", xlab="Months",
+                    color=c("blue","red","green","blue","red","green"))
+```
+
+Or, we can do it much more easily using the tidycmprsk package! Note: must use tidycmprsk object to plot it
+
+```{r}
+cr_surv_obj <- tidycmprsk::Surv(d_full$`Survival months`, as.factor(d_full$cmp_status.n))
+cif_ggfit <- tidycmprsk::cuminc(Surv(`Survival months`, as.factor(cmp_status.n)) ~ stage, data=d_full)
+
+# Or pass Surv directly and model will default to tidycmprsk::Surv
+cif_ggfit <- tidycmprsk::cuminc(Surv(`Survival months`, as.factor(cmp_status.n)) ~ stage, data=d_full)
+cif_ggfit
+```
+
+Filename: Case Listing Session-1 Matrix-2 SEER\*Stat Version: 8.4.4 Date: November 5, 2024
+
+Session Type: Case Listing
+
+SUGGESTED CITATION\
+Software: Surveillance Research Program, National Cancer Institute SEER*Stat software (www.seer.cancer.gov/seerstat) version 8.4.4. Data: Surveillance, Epidemiology, and End Results (SEER) Program (www.seer.cancer.gov) SEER*Stat Database: Incidence - SEER Research Data, 8 Registries, Nov 2023 Sub (1975-2021) - Linked To County Attributes - Time Dependent (1990-2022) Income/Rurality, 1969-2022 Counties, National Cancer Institute, DCCPS, Surveillance Research Program, released April 2024, based on the November 2023 submission.
+
+DATA\
+Database: Incidence - SEER Research Data, 8 Registries, Nov 2023 Sub (1975-2021) - Linked To County Attributes - Time Dependent (1990-2022) Income/Rurality, 1969-2022 Counties
+
+SELECTION\
+Select Only: Malignant Behavior, Known Age
+
+Case: {Site and Morphology.Site recode ICD-O-3/WHO 2008} = 'Breast' AND {Other.Type of Reporting Source} != 'Autopsy only', 'Death certificate only' AND {Cause of Death (COD) and Follow-up.Survival months flag} != 'Not calculated because a Death Certificate Only or Autopsy Only case' AND {Cause of Death (COD) and Follow-up.Survival months} != 'Unknown' AND {Cause of Death (COD) and Follow-up.SEER other cause of death classification} != 'Dead (missing/unknown COD)', 'N/A not seq 0-59' AND {Cause of Death (COD) and Follow-up.SEER cause-specific death classification} != 'Dead (missing/unknown COD)', 'N/A not seq 0-59' AND {Race, Sex, Year Dx.Sex} = 'Female' AND {Multiple Primary Fields.First malignant primary indicator} = 'Yes' AND {Race, Sex, Year Dx.Year of diagnosis} = '2010', '2011', '2012', '2013', '2014', '2015'
+
+OUTPUT\
+Title: Breast Cancer survival data - Diagnoses 2010-2015
+
+TABLE\
+Column: Patient ID Age recode with \<1 year olds Race recode (White, Black, Other) Year of diagnosis Laterality Histology recode - broad groupings SEER historic stage A (1973-2015) Radiation recode Chemotherapy recode (yes, no/unk) ER Status Recode Breast Cancer (1990+) PR Status Recode Breast Cancer (1990+) Derived HER2 Recode (2010+) Breast Subtype (2010+) SEER cause-specific death classification SEER other cause of death classification Survival months Vital status recode (study cutoff used) Race and origin recode (NHW, NHB, NHAIAN, NHAPI, Hispanic) Year of follow-up recode Year of death recode Marital status at diagnosis Median household income inflation adj to 2022 Rural-Urban Continuum Code Race and origin (recommended by SEER) \[Race and origin recode (NHW, NHB, NHAIAN, NHAPI, Hispanic); PRCDA 2020\]
+
+USER DEFINITIONS\
+Race and origin (recommended by SEER) \[Race and origin recode (NHW, NHB, NHAIAN, NHAPI, Hispanic); PRCDA 2020\] Description: These are the groupings typcailly used by SEER for reporting by race and ethnicity for analyses starting in 1990 or later. For more details see:\
+https://seer.cancer.gov/seerstat/variables/seer/race_ethnicity All races/ethnicities: {Race, Sex, Year Dx.Race and origin recode (NHW, NHB, NHAIAN, NHAPI, Hispanic)} = 'Non-Hispanic White', 'Non-Hispanic Black', 'Non-Hispanic American Indian/Alaska Native', 'Non-Hispanic Asian or Pacific Islander', 'Hispanic (All Races)', 'Non-Hispanic Unknown Race' Non-Hispanic White: {Race, Sex, Year Dx.Race and origin recode (NHW, NHB, NHAIAN, NHAPI, Hispanic)} = 'Non-Hispanic White' Non-Hispanic Black: {Race, Sex, Year Dx.Race and origin recode (NHW, NHB, NHAIAN, NHAPI, Hispanic)} = 'Non-Hispanic Black' Non-Hispanic American Indian/Alaska Native (PRCDA counties only): {Race, Sex, Year Dx.Race and origin recode (NHW, NHB, NHAIAN, NHAPI, Hispanic)} = 'Non-Hispanic American Indian/Alaska Native' AND {Race, Sex, Year Dx.PRCDA 2020} = 'PRCDA' Non-Hispanic Asian or Pacific Islander: {Race, Sex, Year Dx.Race and origin recode (NHW, NHB, NHAIAN, NHAPI, Hispanic)} = 'Non-Hispanic Asian or Pacific Islander' Hispanic (All Races): {Race, Sex, Year Dx.Race and origin recode (NHW, NHB, NHAIAN, NHAPI, Hispanic)} = 'Hispanic (All Races)'
